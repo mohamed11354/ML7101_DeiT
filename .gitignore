@@ -3,3 +3,4 @@ datasets
 results
 commands.txt
 log.txt
+run_deit_hybrid_examples.sh

@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import random
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,8 +33,9 @@ class EpochMetrics:
     epoch_time_s: float
     peak_mem_gb: float
     lr: float = 0.0
+    gpu_utilization: str = ""
 
-    def as_dict(self) -> Dict[str, float]:
+    def as_dict(self) -> Dict[str, int | float | str]:
         return {
             "epoch": self.epoch,
             "train_loss": self.train_loss,
@@ -44,6 +47,7 @@ class EpochMetrics:
             "epoch_time_s": self.epoch_time_s,
             "peak_mem_gb": self.peak_mem_gb,
             "lr": self.lr,
+            "gpu_utilization": self.gpu_utilization,
         }
 
 
@@ -272,7 +276,7 @@ def evaluate(
     for images, target in loader:
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type='cuda', enabled=use_amp):
             logits = resolve_model_output(model(images))
             loss = criterion(logits, target)
         top1, top5 = compute_topk(logits, target, topk=(1, 5))
@@ -443,6 +447,148 @@ def current_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0]["lr"])
 
 
+def _visible_cuda_device_tokens() -> List[str]:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not raw:
+        return []
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _cuda_index_to_monitor_selector(cuda_index: int) -> str:
+    visible_tokens = _visible_cuda_device_tokens()
+    if 0 <= int(cuda_index) < len(visible_tokens):
+        return visible_tokens[int(cuda_index)]
+    return str(int(cuda_index))
+
+
+def _query_gpu_utilization_with_nvml(cuda_indices: Sequence[int]) -> Dict[int, float]:
+    import pynvml
+
+    if not getattr(_query_gpu_utilization_with_nvml, "_initialized", False):
+        pynvml.nvmlInit()
+        setattr(_query_gpu_utilization_with_nvml, "_initialized", True)
+
+    handles = getattr(_query_gpu_utilization_with_nvml, "_handles", {})
+    utilization: Dict[int, float] = {}
+    for cuda_index in cuda_indices:
+        if cuda_index not in handles:
+            selector = _cuda_index_to_monitor_selector(cuda_index)
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(int(selector))
+            except ValueError:
+                handle = pynvml.nvmlDeviceGetHandleByUUID(selector.encode("utf-8"))
+            handles[cuda_index] = handle
+        utilization[cuda_index] = float(pynvml.nvmlDeviceGetUtilizationRates(handles[cuda_index]).gpu)
+
+    setattr(_query_gpu_utilization_with_nvml, "_handles", handles)
+    return utilization
+
+
+def _query_gpu_utilization_with_nvidia_smi(cuda_indices: Sequence[int]) -> Dict[int, float]:
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    )
+    values_by_selector: Dict[str, float] = {}
+    for line in output.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3:
+            continue
+        gpu_index, gpu_uuid, gpu_util = parts[:3]
+        try:
+            utilization = float(gpu_util)
+        except ValueError:
+            continue
+        values_by_selector[gpu_index] = utilization
+        values_by_selector[gpu_uuid] = utilization
+
+    utilization: Dict[int, float] = {}
+    for cuda_index in cuda_indices:
+        selector = _cuda_index_to_monitor_selector(cuda_index)
+        if selector in values_by_selector:
+            utilization[cuda_index] = values_by_selector[selector]
+        elif str(cuda_index) in values_by_selector:
+            utilization[cuda_index] = values_by_selector[str(cuda_index)]
+    return utilization
+
+
+def query_gpu_utilization(cuda_indices: Sequence[int]) -> Dict[int, float]:
+    if not torch.cuda.is_available():
+        return {}
+
+    normalized_indices = sorted({int(index) for index in cuda_indices})
+    if not normalized_indices:
+        return {}
+
+    backend = getattr(query_gpu_utilization, "_backend", None)
+    if backend != "unavailable":
+        if backend in (None, "nvml"):
+            try:
+                utilization = _query_gpu_utilization_with_nvml(normalized_indices)
+                setattr(query_gpu_utilization, "_backend", "nvml")
+                return utilization
+            except Exception:
+                setattr(query_gpu_utilization, "_backend", "nvidia-smi")
+        if getattr(query_gpu_utilization, "_backend", None) == "nvidia-smi":
+            try:
+                utilization = _query_gpu_utilization_with_nvidia_smi(normalized_indices)
+                setattr(query_gpu_utilization, "_backend", "nvidia-smi")
+                return utilization
+            except Exception:
+                setattr(query_gpu_utilization, "_backend", "unavailable")
+    return {}
+
+
+def format_gpu_utilization(device_utilization: Sequence[Tuple[str, float]]) -> str:
+    if not device_utilization:
+        return ""
+    return json.dumps({str(device): round(float(utilization), 2) for device, utilization in device_utilization})
+
+
+class GpuUtilizationMonitor:
+    def __init__(self, devices: Sequence[torch.device], sample_interval_s: float = 0.5) -> None:
+        self.cuda_indices: List[int] = []
+        self.device_names: Dict[int, str] = {}
+        for device in devices:
+            if device.type != "cuda":
+                continue
+            index = torch.cuda.current_device() if device.index is None else int(device.index)
+            if index not in self.device_names:
+                self.cuda_indices.append(index)
+                self.device_names[index] = str(torch.device("cuda", index))
+
+        self.sample_interval_s = max(0.0, float(sample_interval_s))
+        self.meters = {index: AverageMeter() for index in self.cuda_indices}
+        self.last_sample_time = 0.0
+
+    def maybe_sample(self, force: bool = False) -> None:
+        if not self.cuda_indices:
+            return
+
+        now = time.perf_counter()
+        if not force and self.last_sample_time > 0.0 and (now - self.last_sample_time) < self.sample_interval_s:
+            return
+
+        utilization = query_gpu_utilization(self.cuda_indices)
+        if not utilization:
+            return
+
+        self.last_sample_time = now
+        for cuda_index, value in utilization.items():
+            self.meters[cuda_index].update(float(value), 1)
+
+    def as_device_utilization(self) -> List[Tuple[str, float]]:
+        return [
+            (self.device_names[cuda_index], self.meters[cuda_index].avg)
+            for cuda_index in self.cuda_indices
+            if self.meters[cuda_index].count > 0
+        ]
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -454,11 +600,12 @@ def train_one_epoch(
     grad_accum_steps: int,
     mixup_fn=None,
     grad_clip: float | None = None,
-) -> Tuple[float, float, int, float, float]:
+) -> Tuple[float, float, int, float, float, List[Tuple[str, float]]]:
     model.train()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    gpu_monitor = GpuUtilizationMonitor([device])
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
     num_samples = 0
@@ -474,7 +621,7 @@ def train_one_epoch(
         if mixup_fn is not None:
             images, target = mixup_fn(images, target)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type='cuda', enabled=use_amp):
             logits = resolve_model_output(model(images))
             loss = criterion(logits, target)
             loss_for_backward = loss / grad_accum_steps
@@ -496,7 +643,9 @@ def train_one_epoch(
 
         loss_meter.update(float(loss.item()), batch_size)
         num_samples += batch_size
+        gpu_monitor.maybe_sample(force=(step == 0))
 
+    gpu_monitor.maybe_sample(force=True)
     epoch_time_s = time.perf_counter() - start_time
     peak_mem_gb = (
         float(torch.cuda.max_memory_allocated(device) / (1024 ** 3))
@@ -504,17 +653,33 @@ def train_one_epoch(
         else 0.0
     )
     top1_value = float("nan") if num_top1_batches == 0 else top1_meter.avg
-    return loss_meter.avg, top1_value, num_samples, epoch_time_s, peak_mem_gb
+    return loss_meter.avg, top1_value, num_samples, epoch_time_s, peak_mem_gb, gpu_monitor.as_device_utilization()
 
 
 def write_metrics_row(csv_path: Path, metrics: EpochMetrics) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not csv_path.exists()
     row = metrics.as_dict()
-    with csv_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+    fieldnames = list(row.keys())
+
+    rewrite_existing_rows: List[Dict[str, str]] | None = None
+    if csv_path.exists():
+        try:
+            with csv_path.open(newline="") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames != fieldnames:
+                    rewrite_existing_rows = list(reader)
+        except Exception:
+            rewrite_existing_rows = []
+
+    write_header = (not csv_path.exists()) or (rewrite_existing_rows is not None)
+    mode = "w" if write_header else "a"
+    with csv_path.open(mode, newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
+            if rewrite_existing_rows:
+                for existing_row in rewrite_existing_rows:
+                    writer.writerow({name: existing_row.get(name, "") for name in fieldnames})
         writer.writerow(row)
 
 

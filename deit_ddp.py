@@ -27,6 +27,8 @@ from deit_common import (
     create_train_criterion,
     current_lr,
     evaluate,
+    format_gpu_utilization,
+    GpuUtilizationMonitor,
     format_run_summary,
     resolve_model_output,
     save_checkpoint,
@@ -232,11 +234,12 @@ def train_one_epoch_ddp(
     grad_accum_steps: int,
     mixup_fn=None,
     grad_clip: float | None = None,
-) -> tuple[float, float, int, float, float]:
+) -> tuple[float, float, int, float, float, list[tuple[str, float]]]:
     model.train()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    gpu_monitor = GpuUtilizationMonitor([device])
     loss_meter = AverageMeter()
     top1_meter = AverageMeter()
     num_samples = 0
@@ -256,7 +259,7 @@ def train_one_epoch_ddp(
         sync_context = nullcontext() if should_step else model.no_sync()
 
         with sync_context:
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(enabled=use_amp):
                 logits = resolve_model_output(model(images))
                 loss = criterion(logits, target)
                 loss_for_backward = loss / grad_accum_steps
@@ -277,7 +280,9 @@ def train_one_epoch_ddp(
 
         loss_meter.update(float(loss.item()), batch_size)
         num_samples += batch_size
+        gpu_monitor.maybe_sample(force=(step == 0))
 
+    gpu_monitor.maybe_sample(force=True)
     epoch_time_s = time.perf_counter() - start_time
     peak_mem_gb = (
         float(torch.cuda.max_memory_allocated(device) / (1024 ** 3))
@@ -285,7 +290,7 @@ def train_one_epoch_ddp(
         else 0.0
     )
     top1_value = float("nan") if num_top1_samples == 0 else top1_meter.avg
-    return loss_meter.avg, top1_value, num_samples, epoch_time_s, peak_mem_gb
+    return loss_meter.avg, top1_value, num_samples, epoch_time_s, peak_mem_gb, gpu_monitor.as_device_utilization()
 
 
 def main() -> None:
@@ -451,7 +456,7 @@ def main() -> None:
             train_sampler.set_epoch(epoch)
             scheduler.step(epoch - 1)
 
-            local_train_loss, local_train_top1, local_num_samples, local_epoch_time_s, local_peak_mem_gb = train_one_epoch_ddp(
+            local_train_loss, local_train_top1, local_num_samples, local_epoch_time_s, local_peak_mem_gb, local_gpu_utilization = train_one_epoch_ddp(
                 model=model,
                 loader=train_loader,
                 optimizer=optimizer,
@@ -475,6 +480,15 @@ def main() -> None:
                 epoch_time_s=local_epoch_time_s,
                 peak_mem_gb=local_peak_mem_gb,
                 device=device,
+            )
+            gathered_gpu_utilization = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered_gpu_utilization, local_gpu_utilization)
+            gpu_utilization = format_gpu_utilization(
+                [
+                    (f"rank{rank_idx}/{device_name}", value)
+                    for rank_idx, per_rank_utilization in enumerate(gathered_gpu_utilization)
+                    for device_name, value in per_rank_utilization
+                ]
             )
             train_throughput = total_num_samples / max(epoch_time_s, 1e-8)
 
@@ -508,6 +522,7 @@ def main() -> None:
                     epoch_time_s=epoch_time_s,
                     peak_mem_gb=peak_mem_gb,
                     lr=current_lr(optimizer),
+                    gpu_utilization=gpu_utilization,
                 )
                 write_metrics_row(metrics_csv, metrics)
 

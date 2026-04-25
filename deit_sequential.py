@@ -19,6 +19,7 @@ from deit_common import (
     create_train_criterion,
     current_lr,
     evaluate,
+    format_gpu_utilization,
     format_run_summary,
     save_checkpoint,
     save_json,
@@ -269,7 +270,7 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         scheduler.step(epoch - 1)
 
-        train_loss, train_top1, num_samples, epoch_time_s, peak_mem_gb = train_one_epoch(
+        train_loss, train_top1, num_samples, epoch_time_s, peak_mem_gb, local_gpu_utilization = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -305,6 +306,7 @@ def main() -> None:
             epoch_time_s=epoch_time_s,
             peak_mem_gb=peak_mem_gb,
             lr=current_lr(optimizer),
+            gpu_utilization=format_gpu_utilization(local_gpu_utilization),
         )
         write_metrics_row(metrics_csv, metrics)
 
