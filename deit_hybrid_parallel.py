@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import argparse
 import contextlib
 import math
@@ -28,7 +29,6 @@ from deit_common import (
     create_train_criterion,
     current_lr,
     format_gpu_utilization,
-    GpuUtilizationMonitor,
     format_run_summary,
     resolve_model_output,
     save_checkpoint,
@@ -38,24 +38,153 @@ from deit_common import (
     write_metrics_row,
 )
 
+import threading
 
-"""
-Hybrid parallel DeiT training.
+try:
+    import pynvml
+except Exception:
+    pynvml = None
 
-Launch examples:
 
-1 GPU baseline:
-    python deit_hybrid_parallel.py --gpus-per-replica 1
+class GpuUtilizationMonitor:
+    """
+    Low-overhead GPU utilization monitor.
 
-2 GPU DDP baseline:
-    torchrun --nproc_per_node 2 deit_hybrid_parallel.py --gpus-per-replica 1
+    - Uses NVML directly (no nvidia-smi subprocesses).
+    - Samples in a background thread.
+    - Starts lazily on the first batch, so DataLoader workers are already alive.
+    - Returns per-device epoch-average utilization as:
+        [("cuda:0", 81.2), ("cuda:1", 77.5)]
+    """
 
-2 GPU model/pipeline parallel:
-    python deit_hybrid_parallel.py --gpus-per-replica 2 --pipeline-chunks 4
+    def __init__(
+        self,
+        devices: Sequence[torch.device],
+        sample_interval_s: float = 1.0,
+    ) -> None:
+        self.devices = [torch.device(d) for d in devices if torch.device(d).type == "cuda"]
+        self.sample_interval_s = max(0.25, float(sample_interval_s))
 
-4 GPU hybrid (2-way model parallel inside each replica + 2-way DDP):
-    torchrun --nproc_per_node 2 deit_hybrid_parallel.py --gpus-per-replica 2 --pipeline-chunks 4
-"""
+        self._enabled = bool(self.devices) and pynvml is not None
+        self._started = False
+        self._closed = False
+
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+        self._handles = []
+        self._names: list[str] = []
+        self._sum: dict[str, float] = {}
+        self._count: dict[str, int] = {}
+
+        # Handle CUDA_VISIBLE_DEVICES masks/reordering when possible.
+        self._visible = [
+            token.strip()
+            for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+            if token.strip()
+        ]
+
+    def _handle_for(self, device: torch.device):
+        idx = 0 if device.index is None else int(device.index)
+
+        if idx < len(self._visible):
+            token = self._visible[idx]
+
+            if token.isdigit():
+                return pynvml.nvmlDeviceGetHandleByIndex(int(token))
+
+            for candidate in (token, token.encode("utf-8")):
+                try:
+                    return pynvml.nvmlDeviceGetHandleByUUID(candidate)
+                except Exception:
+                    pass
+
+        return pynvml.nvmlDeviceGetHandleByIndex(idx)
+
+    def _sample_once(self) -> None:
+        if not self._started:
+            return
+
+        with self._lock:
+            for name, handle in zip(self._names, self._handles):
+                try:
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    self._sum[name] += float(util.gpu)
+                    self._count[name] += 1
+                except Exception:
+                    pass
+
+    def _worker(self) -> None:
+        next_t = time.perf_counter() + self.sample_interval_s
+        while not self._stop.wait(max(0.0, next_t - time.perf_counter())):
+            self._sample_once()
+            next_t += self.sample_interval_s
+
+    def _start(self) -> None:
+        if not self._enabled or self._started or self._closed:
+            return
+
+        try:
+            pynvml.nvmlInit()
+            self._handles = [self._handle_for(device) for device in self.devices]
+            self._names = [str(device) for device in self.devices]
+            self._sum = {name: 0.0 for name in self._names}
+            self._count = {name: 0 for name in self._names}
+
+            self._started = True
+            self._sample_once()  # immediate first sample
+            self._thread = threading.Thread(
+                target=self._worker,
+                name="gpu-util-monitor",
+                daemon=True,
+            )
+            self._thread.start()
+        except Exception:
+            self._enabled = False
+            self._started = False
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    def maybe_sample(self, force: bool = False) -> None:
+        # Keep the hot path free: only react on forced calls.
+        if not force or self._closed or not self._enabled:
+            return
+
+        if not self._started:
+            # Start on the first batch, not before the loader loop.
+            self._start()
+        else:
+            # Optional trailing sample at epoch end.
+            self._sample_once()
+
+    def as_device_utilization(self) -> list[tuple[str, float]]:
+        if not self._closed:
+            self._closed = True
+            self._stop.set()
+
+            if self._thread is not None:
+                self._thread.join(timeout=self.sample_interval_s + 0.1)
+                self._thread = None
+
+            if self._started:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+
+        names = self._names or [str(device) for device in self.devices]
+        return [
+            (
+                name,
+                (self._sum[name] / self._count[name])
+                if self._count.get(name, 0) > 0
+                else float("nan"),
+            )
+            for name in names
+        ]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -618,6 +747,8 @@ def train_one_epoch(
     start_time = time.perf_counter()
 
     for step, (images, target) in enumerate(loader):
+        gpu_monitor.maybe_sample(force=(step == 0))
+
         images = images.to(in_device, non_blocking=True)
         target = target.to(in_device, non_blocking=True)
         batch_size = images.size(0)
@@ -634,7 +765,7 @@ def train_one_epoch(
             sync_context = model.no_sync()
 
         with sync_context:
-            with torch.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
                 logits = resolve_model_output(model(images))
                 loss = criterion(logits, target_for_loss)
                 loss_for_backward = loss / grad_accum_steps
@@ -655,9 +786,9 @@ def train_one_epoch(
 
         loss_meter.update(float(loss.item()), batch_size)
         num_samples += batch_size
-        gpu_monitor.maybe_sample(force=(step == 0))
 
     gpu_monitor.maybe_sample(force=True)
+
     epoch_time_s = distributed_max(time.perf_counter() - start_time, out_device)
     if in_device.type == "cuda":
         peak_mem_local = max(float(torch.cuda.max_memory_allocated(device) / (1024 ** 3)) for device in all_devices)
@@ -668,7 +799,14 @@ def train_one_epoch(
     train_loss = distributed_meter_avg(loss_meter, out_device)
     train_top1 = float("nan") if num_top1_samples == 0 else distributed_meter_avg(top1_meter, out_device)
     global_samples = int(round(distributed_sum(num_samples, out_device)))
-    return train_loss, train_top1, global_samples, epoch_time_s, peak_mem_gb, gpu_monitor.as_device_utilization()
+    return (
+        train_loss,
+        train_top1,
+        global_samples,
+        epoch_time_s,
+        peak_mem_gb,
+        gpu_monitor.as_device_utilization(),
+    )
 
 
 @torch.no_grad()
@@ -689,7 +827,7 @@ def evaluate(
     for images, target in loader:
         images = images.to(in_device, non_blocking=True)
         target = target.to(out_device, non_blocking=True)
-        with torch.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type='cuda', enabled=use_amp):
             logits = resolve_model_output(model(images))
             loss = criterion(logits, target)
         top1, top5 = compute_topk(logits, target, topk=(1, 5))
@@ -863,7 +1001,7 @@ def main() -> None:
                 [
                     (f"rank{rank_idx}/{device_name}", value)
                     for rank_idx, per_rank_utilization in enumerate(gathered_gpu_utilization)
-                    for device_name, value in per_rank_utilization
+                    for device_name, value in (per_rank_utilization or [])
                 ]
             )
         else:

@@ -259,7 +259,7 @@ def train_one_epoch_ddp(
         sync_context = nullcontext() if should_step else model.no_sync()
 
         with sync_context:
-            with torch.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
                 logits = resolve_model_output(model(images))
                 loss = criterion(logits, target)
                 loss_for_backward = loss / grad_accum_steps
