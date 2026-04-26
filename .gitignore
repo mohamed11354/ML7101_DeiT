@@ -4,3 +4,5 @@ results
 commands.txt
 log.txt
 run_deit_hybrid_examples.sh
+analysis_results/
+.codex
